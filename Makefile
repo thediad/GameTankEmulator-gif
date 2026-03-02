@@ -98,7 +98,7 @@ else ifeq ($(OS), wasm)
 else
 	OBJS += $(NATIVE_OBJS)
 	COMPILER_FLAGS = -g `sdl2-config --cflags` $(EXTRA_INCLUDES)
-	LINKER_FLAGS = `sdl2-config --libs`
+	LINKER_FLAGS = `sdl2-config --libs` -lgif
 endif
 
 
@@ -111,7 +111,11 @@ all: bin dist
 bin: $(OUT_DIR)/$(BIN_NAME)
 dist: $(OUT_DIR)/$(ZIP_NAME)
 	@mkdir -p $(DIST_DIR)
-	cp $^ $(DIST_DIR)
+	@if [ -f "$^" ]; then \
+		cp "$^" $(DIST_DIR); \
+	else \
+		echo "archive not present, skipping dist copy"; \
+	fi
 
 install: bin
 	@mkdir -p $(INSTALL_DIR)/bin
@@ -136,7 +140,11 @@ endif
 ifeq ($(OS), wasm) #separate ifblock on purpose
 	cd $(OUT_DIR); zip -9 -y -r -q $(ZIP_NAME) $(BIN_NAME) static index.js index.wasm commit_hash.txt
 else
-	cd $(OUT_DIR); zip -9 -y -r -q $(ZIP_NAME) $(BIN_NAME) SDL2.dll img commit_hash.txt
+	cd $(OUT_DIR); if command -v zip >/dev/null 2>&1; then \
+		zip -9 -y -r -q $(ZIP_NAME) $(BIN_NAME) SDL2.dll img commit_hash.txt; \
+	else \
+		echo "zip not found, skipping archive"; \
+	fi
 endif
 
 # Allow manually setting a commit hash

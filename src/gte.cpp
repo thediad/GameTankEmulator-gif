@@ -9,18 +9,25 @@
 #include <filesystem>
 #include <vector>
 #include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 #include <algorithm>
 #ifdef WASM_BUILD
 #include "emscripten.h"
 #include <emscripten/html5.h>
 #else
 #include "tinyfd/tinyfiledialogs.h"
+#ifndef WASM_BUILD
+#include <sys/resource.h>
+#endif
 #endif
 
 #include "joystick_adapter.h"
 #include "audio_coprocessor.h"
 #include "blitter.h"
 #include "palette.h"
+#include "gametank_palette.h"
 
 #include "timekeeper.h"
 #include "system_state.h"
@@ -44,6 +51,7 @@
 #include "devtools/stepping_window.h"
 #include "devtools/patching_window.h"
 #include "devtools/controller_options_window.h"
+#include "gif_encoder.h"
 #include "imgui.h"
 #include "implot.h"
 #include "imgui/backends/imgui_impl_sdl2.h"
@@ -69,7 +77,7 @@ JoystickAdapter *joysticks;
 SystemState system_state;
 CartridgeState cartridge_state;
 
-const int SCREEN_WIDTH = 683;	
+const int SCREEN_WIDTH = 683;
 const int SCREEN_HEIGHT = 512;
 RGB_Color *palette;
 
@@ -88,6 +96,50 @@ int resetQueued = 0;
 #define MUTE_SOURCE_MANUAL 1
 #define MUTE_SOURCE_MENU 2
 int muteMask = 0;
+
+#ifndef WASM_BUILD
+GIFEncoder* gifEncoder = nullptr;
+bool recordingGIF = false;
+#if !defined(WASM_BUILD)
+// where captured gifs are written
+static const char* GIF_DIR = "gifs";
+
+// queue for frames when recording, processed by worker thread
+static std::queue<std::vector<uint32_t>> gifQueue;
+static std::mutex gifMutex;
+static std::condition_variable gifCond;
+static std::thread gifThread;
+static bool gifThreadRunning = false;
+static const size_t GIF_QUEUE_MAX = 60; // prevent unbounded growth and reduce work backlog
+static int gifFileIndex = 1;
+static char currentGifName[32] = "";
+
+// worker running in background to encode frames
+static void gifWorker() {
+	// lower thread priority where supported
+	#ifdef __linux__
+	setpriority(PRIO_PROCESS, 0, 10);
+	#endif
+	while (true) {
+		std::vector<uint32_t> frame;
+		{
+			std::unique_lock<std::mutex> lock(gifMutex);
+			gifCond.wait(lock, [](){ return !gifQueue.empty() || !gifThreadRunning; });
+			if(!gifThreadRunning && gifQueue.empty())
+				break;
+			frame = std::move(gifQueue.front());
+			gifQueue.pop();
+		}
+		if(gifEncoder) {
+			// use default 17ms delay per frame
+			gifEncoder->addFrame(frame.data(), 17);
+		}
+		// give up CPU briefly to avoid starving audio thread
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+}
+#endif
+#endif
 
 void SaveNVRAM() {
 	fstream file;
@@ -149,7 +201,7 @@ void LoadModifiedFlash() {
 	std::cout << "XORing files together... \n";
 	while(orig_rom && xor_file) {
 		orig_rom.read((char*) buf, 256);
-		xor_file.read((char*) bufx, 256); 
+		xor_file.read((char*) bufx, 256);
 		for(int i = 0; i < orig_rom.gcount(); ++i) {
 			*(rom_cursor++) = buf[i] ^ bufx[i];
 		}
@@ -540,13 +592,13 @@ void randomize_memory() {
 	}
 
 	for(int i = 0; i < VRAM_BUFFER_SIZE; i++) {
-		system_state.vram[i] = rand() % 256;	
+		system_state.vram[i] = rand() % 256;
 	}
 
 	for(int i = 0; i < GRAM_BUFFER_SIZE; i++) {
-		system_state.gram[i] = rand() % 256;	
+		system_state.gram[i] = rand() % 256;
 	}
-	
+
 	system_state.dma_control = rand() % 256;
 	system_state.dma_control_irq = (system_state.dma_control & DMA_COPY_IRQ_BIT) != 0;
 	system_state.banking = rand() % 256;
@@ -710,41 +762,80 @@ extern "C" {
 		SDL_SaveBMP(screenshot, "screenshot.bmp");
 		SDL_FreeSurface(screenshot);
 	}
+
+#ifndef WASM_BUILD
+void toggleGIFRecording() {
+	if(!recordingGIF) {
+		// ensure output folder exists
+		std::error_code ec;
+		std::filesystem::create_directories(GIF_DIR, ec);
+		if(ec) {
+			printf("Warning: could not create gif directory '%s': %s\n", GIF_DIR, ec.message().c_str());
+		}
+
+		// Start recording with automatic color quantization
+		snprintf(currentGifName, sizeof(currentGifName), "%s/capture%02d.gif", GIF_DIR, gifFileIndex++);
+		gifEncoder = new GIFEncoder(GT_WIDTH, GT_HEIGHT);
+		if(gifEncoder->startRecording(currentGifName)) {
+			recordingGIF = true;
+			gifThreadRunning = true;
+			gifThread = std::thread(gifWorker);
+			printf("GIF recording started: %s\n", currentGifName);
+		} else {
+			delete gifEncoder;
+			gifEncoder = nullptr;
+		}
+	} else {
+		// Stop recording: signal worker and join
+		{
+			std::lock_guard<std::mutex> lock(gifMutex);
+			gifThreadRunning = false;
+		}
+		gifCond.notify_one();
+		if(gifThread.joinable()) gifThread.join();
+		if(gifEncoder) {
+			gifEncoder->finishRecording();
+			printf("GIF recording finished: %s\n", currentGifName);
+			delete gifEncoder;
+			gifEncoder = nullptr;
+		}
+		recordingGIF = false;
+	}
+}
+#endif
 }
 #ifndef WASM_BUILD
 template <typename T>
 void closeToolByType() {
-    toolWindows.erase(
-        std::remove_if(
-            toolWindows.begin(),
-            toolWindows.end(),
-            [](BaseWindow* window) {
-                if(dynamic_cast<T*>(window) != nullptr) {
+	toolWindows.erase(
+		std::remove_if(
+			toolWindows.begin(),
+			toolWindows.end(),
+			[](BaseWindow* window) {
+				if(dynamic_cast<T*>(window) != nullptr) {
 					delete window;
 					return true;
 				}
 				return false;
-            }
-        ),
-        toolWindows.end()
-    );
+			}
+		),
+		toolWindows.end());
 }
 
 template <typename T>
 bool toolTypeIsOpen() {
-    for (const auto& window : toolWindows) {
-        if (dynamic_cast<T*>(window) != nullptr) {
-            return true;
-        }
-    }
-    return false;
+	for (auto w : toolWindows) {
+		if (dynamic_cast<T*>(w) != nullptr) return true;
+	}
+	return false;
 }
 
-void toggleProfilerWindow() {
-	if(!toolTypeIsOpen<ProfilerWindow>()) {
-		toolWindows.push_back(new ProfilerWindow(profiler));
+void toggleVRAMWindow() {
+	if(!toolTypeIsOpen<VRAMWindow>()) {
+		toolWindows.push_back(new VRAMWindow(vRAM_Surface, gRAM_Surface,
+			&system_state, cpu_core, &cartridge_state));
 	} else {
-		closeToolByType<ProfilerWindow>();
+		closeToolByType<VRAMWindow>();
 	}
 }
 
@@ -756,12 +847,11 @@ void toggleMemBrowserWindow() {
 	}
 }
 
-void toggleVRAMWindow() {
-	if(!toolTypeIsOpen<VRAMWindow>()) {
-		toolWindows.push_back(new VRAMWindow(vRAM_Surface, gRAM_Surface,
-			&system_state, cpu_core, &cartridge_state));
+void toggleProfilerWindow() {
+	if(!toolTypeIsOpen<ProfilerWindow>()) {
+		toolWindows.push_back(new ProfilerWindow(profiler));
 	} else {
-		closeToolByType<VRAMWindow>();
+		closeToolByType<ProfilerWindow>();
 	}
 }
 
@@ -834,6 +924,7 @@ HotkeyAssignment hotkeys[] = {
 	{&doRamDump, SDLK_F6},
 	{&toggleSteppingWindow, SDLK_F7},
 	{&takeScreenShot, SDLK_F8},
+	{&toggleGIFRecording, SDLK_F5},
 	{&toggleMemBrowserWindow, SDLK_F9},
 	{&toggleVRAMWindow, SDLK_F10},
 	{&toggleProfilerWindow, SDLK_F12},
@@ -869,6 +960,24 @@ void refreshScreen() {
 	//SDL_BlitScaled(vRAM_Surface, &src, screenSurface, &dest);
 	SDL_UpdateTexture(framebufferTexture, NULL, vRAM_Surface->pixels, vRAM_Surface->pitch);
 
+#ifndef WASM_BUILD
+	// Capture frame for GIF if recording
+	if(recordingGIF && gifEncoder && gifEncoder->recording()) {
+		// enqueue a copy of the framebuffer for background encoding
+		std::vector<uint32_t> frame(GT_WIDTH * GT_HEIGHT);
+		memcpy(frame.data(), vRAM_Surface->pixels, GT_WIDTH * GT_HEIGHT * sizeof(uint32_t));
+		{
+			std::lock_guard<std::mutex> lock(gifMutex);
+			if(gifQueue.size() >= GIF_QUEUE_MAX) {
+				// drop oldest frame to keep queue bounded
+				gifQueue.pop();
+			}
+			gifQueue.push(std::move(frame));
+		}
+		gifCond.notify_one();
+	}
+#endif
+
 	SDL_RenderClear(mainRenderer);
 	SDL_RenderCopy(mainRenderer, framebufferTexture, &src, &dest);
 
@@ -896,7 +1005,7 @@ void refreshScreen() {
 					const char* rom_file_name = open_rom_dialog();
 					if(rom_file_name) {
 						LoadRomFile(rom_file_name);
-					}	
+					}
 				}
 				if(ImGui::MenuItem("Exit")) {
 					running = false;
@@ -956,7 +1065,7 @@ void refreshScreen() {
 		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0.5f)); // 50% transparent black
 		ImGui::Begin("OverlayBackground", nullptr,
 			ImGuiWindowFlags_NoDecoration |
-			ImGuiWindowFlags_NoInputs | 
+			ImGuiWindowFlags_NoInputs |
 			ImGuiWindowFlags_NoMove |
 			ImGuiWindowFlags_NoBringToFrontOnFocus);
 		ImGui::End();
@@ -981,7 +1090,7 @@ void refreshScreen() {
 
 		if (ImGui::IsWindowAppearing())
     		ImGui::SetKeyboardFocusHere(-1);
-		
+
 
 		if (ImGui::BeginMenu("Options")) {
 			// These are items inside the pop-out menu
@@ -1093,7 +1202,7 @@ EM_BOOL mainloop(double time, void* userdata) {
 				if(timekeeper.lastTicks != 0) {
 					int time_error = (timekeeper.currentTicks - timekeeper.lastTicks) - (1000 * intended_cycles/timekeeper.system_clock);
 					if(timekeeper.frameCount == 100) {
-#ifndef WRAPPER_MODE						
+#ifndef WRAPPER_MODE
 					  sprintf(titlebuf, "%s | %s | s: %.1f inc: %.1f err: %d\n", WINDOW_TITLE, currentRomFilePath.c_str(), timekeeper.time_scaling, timekeeper.scaling_increment, time_error);
 						SDL_SetWindowTitle(mainWindow, titlebuf);
 #endif
@@ -1153,7 +1262,7 @@ EM_BOOL mainloop(double time, void* userdata) {
 				SDL_Delay(16);
 		}
 		blitter->CatchUp();
-		
+
 
 		if(EmulatorConfig::noSound) {
 			AudioCoprocessor::fill_audio(AudioCoprocessor::singleton_acp_state, NULL, AudioCoprocessor::singleton_acp_state->samples_per_frame);
@@ -1203,7 +1312,7 @@ EM_BOOL mainloop(double time, void* userdata) {
 								break;
 							case SDLK_RSHIFT:
 								rshift = (e.type == SDL_KEYDOWN);
-								break;							
+								break;
 							case SDLK_ESCAPE:
 								#if !defined(DISABLE_ESC)
 								if(e.type == SDL_KEYDOWN) {
@@ -1274,7 +1383,7 @@ EM_BOOL mainloop(double time, void* userdata) {
 		});
 		toolWindows.erase(to_be_removed, end(toolWindows));
 #endif
-		
+
 	if(!running) {
 #ifdef WASM_BUILD
 		emscripten_cancel_main_loop();
@@ -1351,7 +1460,7 @@ int main(int argC, char* argV[]) {
 	cartridge_state.write_mode = false;
 	blitter = new Blitter(cpu_core, &timekeeper, &system_state, vRAM_Surface);
 	randomize_memory();
-	
+
 	SDL_Init(SDL_INIT_VIDEO);
 	atexit(SDL_Quit);
 
@@ -1403,7 +1512,7 @@ int main(int argC, char* argV[]) {
 			"warning");
 		}
 #endif
-		
+
 	}
 
 #ifdef WASM_BUILD
