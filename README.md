@@ -35,13 +35,15 @@ Other utility keys are:
 
 * Shift+R for HARD reset that randomizes memory and registers, to simulate a cold boot
 
-* Press Esc to exit the program
+* Press Esc to toggle the menu toolbar.
 
 * Press O to load a rom file at runtime. The dialog also appears if the emulator is launched without specifying a rom file.
 
-* Press F9 to load the profiling window. (Only does anything if the ROM uses the debug hooks)
+* Press F9 to load the memory browser.
 
 * Press F10 to open a window that displays some system state info such as the CPU status register or the contents of video/graphics memory.
+
+* Press F12 to open the timing profiler. The ACP value represents the number of cycles per sample rate used by the audio co-processor, measured from the IRQ to the RTI.
 
 For Windows users, I've set up an automated [nightly build](https://gametank.zone/emulator/win/latest.php) that contains the latest features... and of course the latest bugs.
 
