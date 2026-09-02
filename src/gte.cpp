@@ -523,7 +523,7 @@ void MemoryWrite(uint16_t address, uint8_t value) {
 		soundcard->ram_write(address, value);
 	} else if((address & 0x2000)) {
 		if(address & 0x800) {
-			if(loadedRomType == RomType::FLASH2M) {
+			if((loadedRomType == RomType::FLASH2M) || (loadedRomType == RomType::FLASH2M_RAM32K)) {
 				if((address & 0xF) == VIA_ORA) {
 					UpdateFlashShiftRegister(value);
 				}
