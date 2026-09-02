@@ -162,6 +162,10 @@ AudioCoprocessor::AudioCoprocessor() {
     state.irqRate = 0;
     state.resetting = false;
     state.running = false;
+    /* The SDL callback runs even before a cartridge starts the ACP.  The DAC
+     * is unsigned and centered at 128, so initialize it to silence instead of
+     * letting the callback amplify an indeterminate byte. */
+    state.dacReg = 128;
     state.clksPerHostSample = 0;
     state.cycles_per_sample = 1024;
     state.samples_per_frame = 233;
