@@ -105,14 +105,19 @@ int resetQueued = 0;
 int muteMask = 0;
 bool paddle_emulation_enabled = false;
 bool paddle_touch_mode = false;
+bool saveRamDirty = false;
 
 void SaveNVRAM() {
-	fstream file;
-	if(loadedRomType != RomType::FLASH2M_RAM32K) return;
-	printf("SAVING %s\n", nvramFileFullPath.c_str());
-	file.open(nvramFileFullPath.c_str(), ios_base::out | ios_base::binary | ios_base::trunc);
-	file.write((char*) cartridge_state.save_ram, CARTRAMSIZE);
-	file.close();
+        fstream file;
+        if(loadedRomType != RomType::FLASH2M_RAM32K) return;
+        if(!saveRamDirty) return;
+
+        printf("SAVING %s\n", nvramFileFullPath.c_str());
+        file.open(nvramFileFullPath.c_str(), ios_base::out | ios_base::binary | ios_base::trunc);
+        file.write((char*) cartridge_state.save_ram, CARTRAMSIZE);
+        file.close();
+
+        saveRamDirty = false;
 }
 
 void LoadNVRAM() {
@@ -443,7 +448,10 @@ void MemoryWrite(uint16_t address, uint8_t value) {
 		if(loadedRomType == RomType::FLASH2M_RAM32K) {
 			if(!(address & 0x4000)) {
 				if(!(cartridge_state.bank_mask & 0x80)) {
-					cartridge_state.save_ram[(address & 0x3FFF) | ((cartridge_state.bank_mask & 0x40) << 8)] = value;
+					if(cartridge_state.save_ram[(address & 0x3FFF) | ((cartridge_state.bank_mask & 0x40) << 8)] != value) {
+					        cartridge_state.save_ram[(address & 0x3FFF) | ((cartridge_state.bank_mask & 0x40) << 8)] = value;
+					        saveRamDirty = true;
+					}
 				}
 			}
 		}
